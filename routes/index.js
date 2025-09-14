@@ -43,6 +43,42 @@ function base64UrlDecode(str) {
   return Buffer.from(str, 'base64').toString('utf8');
 }
 
+async function postEmailFetch(meta, full) {
+  try {
+    // Example: log and demonstrate access to body/header
+    // You can replace this with DB persistence, webhook, NLP processing, etc.
+    console.log('postEmailFetch called for message id:', meta.id);
+
+    // Example: extract a plain text payload if present (best-effort)
+    let bodyText = '';
+    const payload = full?.data?.payload;
+    if (payload) {
+      // If 'parts' exist, try to find text/plain part; otherwise look at body.data
+      if (payload.parts && Array.isArray(payload.parts)) {
+        // naive traversal -- you might want a robust recursive extractor
+        const part = payload.parts.find(p => p.mimeType === 'text/plain') || payload.parts[0];
+        if (part && part.body && part.body.data) {
+          bodyText = Buffer.from(part.body.data, 'base64').toString('utf8');
+        }
+      } else if (payload.body && payload.body.data) {
+        bodyText = Buffer.from(payload.body.data, 'base64').toString('utf8');
+      }
+    }
+
+    // Do something with meta and bodyText:
+    // e.g. persist to DB, call an external service, trigger a background job, etc.
+    // For now we'll just log snippet + body length to keep it safe and generic.
+    console.log(`meta.subject="${meta.subject}" from="${meta.from}" snippetLen=${(meta.snippet||'').length} bodyLen=${bodyText.length}`);
+
+    // If you want to return something, return it. Otherwise return undefined.
+    return { handled: true };
+  } catch (err) {
+    // Do NOT throw here unless you want upstream callers to fail.
+    console.error('postEmailFetch error:', err);
+    return { handled: false, error: err.message };
+  }
+}
+
 /* GET home page. */
 router.get('/', function(req, res, next) {
   res.render('index', { title: 'Express' });
@@ -108,13 +144,23 @@ router.get('/messages', async (req, res) => {
       const headers = full.data.payload?.headers || [];
       const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
       const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
-      results.push({
+      const msgMeta = {
         id: m.id,
         threadId: full.data.threadId,
         snippet: full.data.snippet,
         from,
         subject
-      });
+      };
+
+      // call the post-fetch hook (await so caller sees errors if you want)
+      try {
+        await postEmailFetch(msgMeta, full);
+      } catch (hookErr) {
+        // we already catch inside postEmailFetch, but keep this defensive
+        console.error('Error in postEmailFetch (messages endpoint):', hookErr);
+      }
+
+      results.push(msgMeta);
     }
     res.json(results);
   } catch (err) {
@@ -135,6 +181,15 @@ router.get('/messages/:id/raw', async (req, res) => {
     });
     const raw = full.data.raw;
     const decoded = base64UrlDecode(raw);
+
+    // Optionally call postEmailFetch here too (we pass a minimal meta and full)
+    const meta = { id: req.params.id, threadId: full.data.threadId, snippet: full.data.snippet || '' };
+    try {
+      await postEmailFetch(meta, full);
+    } catch (hookErr) {
+      console.error('Error in postEmailFetch (raw endpoint):', hookErr);
+    }
+
     res.type('text/plain').send(decoded);
   } catch (err) {
     console.error(err);
@@ -161,10 +216,33 @@ try {
         const messages = r.data.messages || [];
         if (messages.length) {
           console.log('Cron: fetched', messages.length, 'messages at', new Date().toISOString());
-          // optionally fetch bodies or process them
-          // e.g. fetch first message body:
-          // const full = await gmail.users.messages.get({userId: 'me', id: messages[0].id, format:'full'});
-          // console.log(full.data.snippet);
+
+          // fetch and handle each message (call postEmailFetch for processing)
+          for (const m of messages) {
+            try {
+              const full = await gmail.users.messages.get({
+                userId: 'me',
+                id: m.id,
+                format: 'full'
+              });
+
+              const headers = full.data.payload?.headers || [];
+              const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+              const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
+              const msgMeta = {
+                id: m.id,
+                threadId: full.data.threadId,
+                snippet: full.data.snippet,
+                from,
+                subject
+              };
+
+              // call the same hook used in endpoints
+              await postEmailFetch(msgMeta, full);
+            } catch (innerErr) {
+              console.error('Error fetching or processing message in cron:', innerErr);
+            }
+          }
         }
       } catch (err) {
         console.error('Cron error', err.message || err);
