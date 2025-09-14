@@ -1,13 +1,13 @@
 import { GoogleGenAI } from "@google/genai";
 
 
-export async function respond_mail(thread,toEmail,subject) {
-  const ai = new GoogleGenAI({apiKey:process.env.GOOGLE_API_KEY});
+export async function respond_mail(thread, toEmail, subject) {
+    const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY });
 
-  //context
+    //context
 
-  const context = `
-  CubeRoot : Voice AI That Works Like Your Best Agent, at Scale
+    const context = `
+  CubeRoot (cuberoot.ai) : Voice AI That Works Like Your Best Agent, at Scale
 Overcome language barriers, high costs, and inadequate support, ensuring top-notch customer and citizen experiences. Build tailored Gen AI Voice Agents/bots, providing 24/7 assistance, cutting operational costs, ensuring security, and delivering scalable intelligent interactions.
 
 
@@ -89,16 +89,22 @@ Experiences Designed to Engage, Every Step of the Way.
 For banks and financial institutions, technology investments hinge on several key criteria: flexibility, customization capabilities, process automation, 99% uptime, the technology partner’s in-house tech-stack and proven industry experience. Voice AI Agents, in particular, have demonstrated their capability in automating repetitive queries, lead generation, and lead qualification. As AI models continue to learn and evolve, these agents will be able to handle more complex customer queries in the future.
   `
 
-  const prompt = {
-    model: "gemini-1.5-flash-8b-001",
-    contents: `You are an expert email responder. A user has sent the following email, which is in JSON array format. Please analyze the email and generate a professional and helpful response, also text format. Maintain the original tone of the email as much as possible. Here is the context of the company: ${context}\n\n Here is the email content:\n\n${thread}`
-  }
+    const prompt = {
+        model: "gemma-3n-e2b-it",
+        contents: `You are an expert email responder. A user has sent the following email, which is in JSON array format. Please analyze the email and generate a professional and helpful response in text format just the body of the email. Maintain the original tone of the email as much as possible. Here is the context of the company: ${context}\n\n Here is the email content:\n\n${thread}`
+    }
 
-  const repsonse = await ai.models.generateContent(prompt);
-  const text = repsonse?.candidates?.[0]?.content?.parts?.[0]?.text;
-  console.log(text);
-  
-  return text;
+    const repsonse = await ai.models.generateContent(prompt);
+    let text = repsonse?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (text.startsWith("```json")) {
+        text = text.substring(7, text.length - 3).trim();
+    }
+    console.log({text});
+    return {
+        subject: `Re: ${subject}`,
+        body: text,
+        toEmail: toEmail
+    }
 
 }
 

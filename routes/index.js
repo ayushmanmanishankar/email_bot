@@ -51,24 +51,26 @@ async function postEmailFetch(meta, full) {
    //mechanism to fetch whole thread
 
    //send to llm
-   const toEmail=meta.from;
-   const subject=meta.subject;
+   const toEmail="devraj.parida@reverieinc.com";
+   const subject="Cuberoot inquiry";
    const thread=[{
     "id": "199486cfb1716fef",
     "threadId": "1994862642ca6aee",
-    "snippet": "This is test again On Sun, Sep 14, 2025 at 6:50 PM Devraj Parida &lt;devraj.parida@reverieinc.com&gt; wrote: This is a test Mail",
+    "snippet": "What are the services that will be used in the integration",
     "from": "Devraj Parida \u003Cdevraj.parida@reverieinc.com\u003E",
-    "subject": "Re: Test Content"
+    "subject": "Re: Cuberoot inquiry"
   },
   {
     "id": "1994862642ca6aee",
     "threadId": "1994862642ca6aee",
-    "snippet": "This is a test Mail",
+    "snippet": "I want to now how fast it is to integrate with our CRM, and how much it will cost also what will be the integration process and avalability",
     "from": "Devraj Parida \u003Cdevraj.parida@reverieinc.com\u003E",
-    "subject": "Test Content"
+    "subject": "Cuberoot inquiry"
   },];
 
-  await respond_mail(thread,toEmail,subject);
+  const response = await respond_mail(thread,toEmail,subject);
+  console.log({response});
+
   } catch (err) {
     // Do NOT throw here unless you want upstream callers to fail.
     console.error('postEmailFetch error:', err);
@@ -216,6 +218,8 @@ try {
         if (messages.length) {
           console.log('Cron: fetched', messages.length, 'messages at', new Date().toISOString());
 
+           await postEmailFetch(messages, null);
+
           // fetch and handle each message (call postEmailFetch for processing)
           for (const m of messages) {
             try {
@@ -241,7 +245,7 @@ try {
               };
 
               // call the same hook used in endpoints
-              await postEmailFetch(msgMeta, full);
+              // await postEmailFetch(msgMeta, full);
             } catch (innerErr) {
               console.error('Error fetching or processing message in cron:', innerErr);
             }
