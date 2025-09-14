@@ -7,6 +7,7 @@ const { google } = require('googleapis');
 const cron = require('node-cron');
 
 const credentials = require('../credentials.json');
+const { respond_mail } = require('../controller/respond_mail');
 // credentials may be in installed or web block depending on how you downloaded them:
 const { client_id, client_secret } = credentials.installed || credentials.web;
 
@@ -45,33 +46,29 @@ function base64UrlDecode(str) {
 
 async function postEmailFetch(meta, full) {
   try {
-    // Example: log and demonstrate access to body/header
-    // You can replace this with DB persistence, webhook, NLP processing, etc.
-    console.log('postEmailFetch called for message id:', meta.id);
+   //mechanism to identify replied or not
+    
+   //mechanism to fetch whole thread
 
-    // Example: extract a plain text payload if present (best-effort)
-    let bodyText = '';
-    const payload = full?.data?.payload;
-    if (payload) {
-      // If 'parts' exist, try to find text/plain part; otherwise look at body.data
-      if (payload.parts && Array.isArray(payload.parts)) {
-        // naive traversal -- you might want a robust recursive extractor
-        const part = payload.parts.find(p => p.mimeType === 'text/plain') || payload.parts[0];
-        if (part && part.body && part.body.data) {
-          bodyText = Buffer.from(part.body.data, 'base64').toString('utf8');
-        }
-      } else if (payload.body && payload.body.data) {
-        bodyText = Buffer.from(payload.body.data, 'base64').toString('utf8');
-      }
-    }
+   //send to llm
+   const toEmail=meta.from;
+   const subject=meta.subject;
+   const thread=[{
+    "id": "199486cfb1716fef",
+    "threadId": "1994862642ca6aee",
+    "snippet": "This is test again On Sun, Sep 14, 2025 at 6:50 PM Devraj Parida &lt;devraj.parida@reverieinc.com&gt; wrote: This is a test Mail",
+    "from": "Devraj Parida \u003Cdevraj.parida@reverieinc.com\u003E",
+    "subject": "Re: Test Content"
+  },
+  {
+    "id": "1994862642ca6aee",
+    "threadId": "1994862642ca6aee",
+    "snippet": "This is a test Mail",
+    "from": "Devraj Parida \u003Cdevraj.parida@reverieinc.com\u003E",
+    "subject": "Test Content"
+  },];
 
-    // Do something with meta and bodyText:
-    // e.g. persist to DB, call an external service, trigger a background job, etc.
-    // For now we'll just log snippet + body length to keep it safe and generic.
-    console.log(`meta.subject="${meta.subject}" from="${meta.from}" snippetLen=${(meta.snippet||'').length} bodyLen=${bodyText.length}`);
-
-    // If you want to return something, return it. Otherwise return undefined.
-    return { handled: true };
+  await respond_mail(thread,toEmail,subject);
   } catch (err) {
     // Do NOT throw here unless you want upstream callers to fail.
     console.error('postEmailFetch error:', err);
@@ -230,6 +227,10 @@ try {
 
               const headers = full.data.payload?.headers || [];
               const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
+              if(from.includes('ayushman.manishankar@reverieinc.com')){
+                console.log('Reverie email found');
+                continue;
+              }
               const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
               const msgMeta = {
                 id: m.id,

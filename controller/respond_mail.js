@@ -1,8 +1,8 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenAI } from "@google/genai";
 
 
-export async function respond_mail(email) {
-  const ai = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+export async function respond_mail(thread,toEmail,subject) {
+  const ai = new GoogleGenAI({apiKey:process.env.GOOGLE_API_KEY});
 
   //context
 
@@ -90,15 +90,16 @@ For banks and financial institutions, technology investments hinge on several ke
   `
 
   const prompt = {
-    model: "gemini-2.5-flash",
-    contents: `You are an expert email responder. A user has sent the following email, which is in HTML format. Please analyze the email and generate a professional and helpful response, also in HTML format. Maintain the original tone of the email as much as possible. Here is the context of the company: ${context}\n\n Here is the email content:\n\n${email}`
+    model: "gemini-1.5-flash-8b-001",
+    contents: `You are an expert email responder. A user has sent the following email, which is in JSON array format. Please analyze the email and generate a professional and helpful response, also text format. Maintain the original tone of the email as much as possible. Here is the context of the company: ${context}\n\n Here is the email content:\n\n${thread}`
   }
 
   const repsonse = await ai.models.generateContent(prompt);
-  const text = repsonse.text();
+  const text = repsonse?.candidates?.[0]?.content?.parts?.[0]?.text;
   console.log(text);
   
-//   await sendMail(email, text);
+  return text;
+
 }
 
 async function sendMail(email, response) {
