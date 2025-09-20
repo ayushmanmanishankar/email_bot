@@ -52,7 +52,7 @@ async function startGmailPoller(oauth2Client, ensureAuth) {
 
         const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-        const listRes = await gmail.users.messages.list({ userId: 'me', maxResults: 10 });
+        const listRes = await gmail.users.messages.list({ userId: 'me', maxResults: 10, includeSpam: true });
         const messages = listRes.data.messages || [];
         if (!messages.length) return;
 
