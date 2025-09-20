@@ -1,17 +1,14 @@
-// routes/index.js
 const express = require('express');
 const router = express.Router();
 const fs = require('fs');
 const path = require('path');
 const { google } = require('googleapis');
-const cron = require('node-cron');
+const { startGmailPoller } = require('../controller/poll_mail');
+const { _internal } = require('../controller/process_mail');
 
 const credentials = require('../credentials.json');
-const { respond_mail } = require('../controller/respond_mail');
-// credentials may be in installed or web block depending on how you downloaded them:
 const { client_id, client_secret } = credentials.installed || credentials.web;
 
-// IMPORTANT: redirect URI must match what you set in Google Cloud Console
 const REDIRECT_URI = 'http://localhost:3000/oauth2callback';
 
 const oauth2Client = new google.auth.OAuth2(
@@ -20,10 +17,30 @@ const oauth2Client = new google.auth.OAuth2(
   REDIRECT_URI
 );
 
-// Gmail scope (read-only). Change to other scopes if you need modify/send.
-const SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
+// Register the tokens listener exactly once (move this out of ensureAuth)
+if (!oauth2Client.__tokensListenerAdded) {
+  oauth2Client.on('tokens', (newTokens) => {
+    try {
+      // merge new tokens with previously saved ones if you like
+      const existing = loadTokens() || {};
+      const updated = { ...existing, ...newTokens };
+      saveTokens(updated);
+      console.log('Tokens refreshed and saved.');
+    } catch (err) {
+      console.error('Failed saving refreshed tokens:', err);
+    }
+  });
+  // mark flag so we won't add again
+  oauth2Client.__tokensListenerAdded = true;
+}
 
-// Where we'll persist tokens in this example (replace with secure store in prod)
+// Gmail scopes
+const SCOPES = [
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/gmail.modify'
+];
+
 const TOKEN_PATH = path.join(__dirname, '..', 'tokens.json');
 
 function saveTokens(tokens) {
@@ -35,232 +52,88 @@ function loadTokens() {
   return JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
 }
 
-// Utility: decode base64url (Gmail returns base64url encoded raw parts)
-function base64UrlDecode(str) {
-  // replace URL-safe chars then decode
-  str = str.replace(/-/g, '+').replace(/_/g, '/');
-  // pad with =
-  while (str.length % 4) str += '=';
-  return Buffer.from(str, 'base64').toString('utf8');
-}
+// ----------------------------------------
+// Ensure OAuth2 client has valid tokens
+// ----------------------------------------
+async function ensureAuth() {
+  const tokens = loadTokens();
+  if (!tokens) {
+    throw new Error('No stored tokens. Visit /auth to authorize the app.');
+  }
+  // set credentials (this won't add listeners)
+  oauth2Client.setCredentials(tokens);
 
-async function postEmailFetch(meta, full) {
-  try {
-   //mechanism to identify replied or not
-    
-   //mechanism to fetch whole thread
-
-   //send to llm
-   const toEmail="devraj.parida@reverieinc.com";
-   const subject="Cuberoot inquiry";
-   const thread=[{
-    "id": "199486cfb1716fef",
-    "threadId": "1994862642ca6aee",
-    "snippet": "What are the services that will be used in the integration",
-    "from": "Devraj Parida \u003Cdevraj.parida@reverieinc.com\u003E",
-    "subject": "Re: Cuberoot inquiry"
-  },
-  {
-    "id": "1994862642ca6aee",
-    "threadId": "1994862642ca6aee",
-    "snippet": "I want to now how fast it is to integrate with our CRM, and how much it will cost also what will be the integration process and avalability",
-    "from": "Devraj Parida \u003Cdevraj.parida@reverieinc.com\u003E",
-    "subject": "Cuberoot inquiry"
-  },];
-
-  const response = await respond_mail(thread,toEmail,subject);
-  console.log({response});
-
-  } catch (err) {
-    // Do NOT throw here unless you want upstream callers to fail.
-    console.error('postEmailFetch error:', err);
-    return { handled: false, error: err.message };
+  // Optionally, validate there is an access_token; if expired you will get 401 on calls and client will try refresh
+  if (!oauth2Client.credentials || !oauth2Client.credentials.access_token) {
+    // still allow poller to call and the client will refresh using refresh_token when API calls are made,
+    // but you can throw here if you prefer earlier failure
+    console.warn('ensureAuth: oauth2Client has no access_token currently (will attempt refresh on demand).');
   }
 }
 
-/* GET home page. */
-router.get('/', function(req, res, next) {
+// ----------------------------------------
+// Routes
+// ----------------------------------------
+
+// Home
+router.get('/', (req, res) => {
   res.render('index', { title: 'Express' });
 });
 
-
-
-// Start OAuth flow: visit /auth to grant access
+// Start OAuth flow
 router.get('/auth', (req, res) => {
   const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline', // important to get refresh_token
+    access_type: 'offline', // ensures refresh_token is returned
     scope: SCOPES,
-    prompt: 'consent'       // ensure refresh_token is returned on first consent
+    prompt: 'consent'       // always return refresh_token for first-time auth
   });
   res.redirect(url);
 });
 
-// OAuth2 callback route configured in Google Cloud Console
+// OAuth2 callback
 router.get('/oauth2callback', async (req, res) => {
   const code = req.query.code;
-  if (!code) {
-    return res.status(400).send('Missing code in query');
-  }
+  if (!code) return res.status(400).send('Missing code in query');
+
   try {
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
-    // persist tokens
     saveTokens(tokens);
-    res.send('Authorization successful — tokens saved. You can close this window.');
+
+    // Start Gmail poller now that we have tokens
+    await startGmailPoller(oauth2Client, ensureAuth);
+
+    res.send('Authorization successful — tokens saved and Gmail poller started. You can close this window.');
   } catch (err) {
     console.error('Error exchanging code for token', err);
     res.status(500).send('Error while trying to exchange code for token');
   }
 });
 
-// Helper: ensure oauth2Client has credentials (either from file or env)
-async function ensureAuth() {
-  const tokens = loadTokens();
-  if (tokens) {
-    oauth2Client.setCredentials(tokens);
-  } else {
-    throw new Error('No stored tokens. Visit /auth to authorize the app.');
-  }
-}
-
-// Example API endpoint: list last N messages (ids and snippet)
+// Example: list messages from local DB
 router.get('/messages', async (req, res) => {
   try {
-    await ensureAuth();
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const listRes = await gmail.users.messages.list({
-      userId: 'me',
-      maxResults: 20
-    });
-    const messages = (listRes.data.messages || []);
-    // fetch details for each message (you can limit fields)
-    const results = [];
-    for (const m of messages) {
-      const full = await gmail.users.messages.get({
-        userId: 'me',
-        id: m.id,
-        format: 'full' // or 'minimal','metadata','raw'
-      });
-      // snippet + headers sample
-      const headers = full.data.payload?.headers || [];
-      const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
-      const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
-      const msgMeta = {
-        id: m.id,
-        threadId: full.data.threadId,
-        snippet: full.data.snippet,
-        from,
-        subject
-      };
+    const db = await _internal.loadDB();
+    db.messages = db.messages || {};
 
-      // call the post-fetch hook (await so caller sees errors if you want)
-      try {
-        await postEmailFetch(msgMeta, full);
-      } catch (hookErr) {
-        // we already catch inside postEmailFetch, but keep this defensive
-        console.error('Error in postEmailFetch (messages endpoint):', hookErr);
-      }
-
-      results.push(msgMeta);
-    }
+    const results = Object.values(db.messages).sort((a, b) => new Date(b.date) - new Date(a.date));
     res.json(results);
   } catch (err) {
-    console.error(err);
+    console.error('Error in /messages:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Example endpoint: get raw body (for one message id)
-router.get('/messages/:id/raw', async (req, res) => {
+// ----------------------------------------
+// Start Gmail poller
+// ----------------------------------------
+(async () => {
   try {
     await ensureAuth();
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const full = await gmail.users.messages.get({
-      userId: 'me',
-      id: req.params.id,
-      format: 'raw' // raw is base64url encoded full RFC822 message
-    });
-    const raw = full.data.raw;
-    const decoded = base64UrlDecode(raw);
-
-    // Optionally call postEmailFetch here too (we pass a minimal meta and full)
-    const meta = { id: req.params.id, threadId: full.data.threadId, snippet: full.data.snippet || '' };
-    try {
-      await postEmailFetch(meta, full);
-    } catch (hookErr) {
-      console.error('Error in postEmailFetch (raw endpoint):', hookErr);
-    }
-
-    res.type('text/plain').send(decoded);
+    await startGmailPoller(oauth2Client, ensureAuth);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    console.log('Cron not started. Visit /auth to authorize.', err.message);
   }
-});
+})();
 
-/*
-  Example cron job:
-  - polls Gmail every minute for new messages (you can change schedule)
-  - this demonstrates how to run periodic fetches server-side
-  In production you might want push notifications (Pub/Sub) instead of polling.
-*/
-// Only start cron if tokens exist (avoid repeated auth errors)
-try {
-  const tokens = loadTokens();
-  if (tokens) {
-    oauth2Client.setCredentials(tokens);
-    // run every minute: change cron schedule as needed
-    cron.schedule('* * * * *', async () => {
-      try {
-        const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-        const r = await gmail.users.messages.list({ userId: 'me', maxResults: 5 });
-        const messages = r.data.messages || [];
-        if (messages.length) {
-          console.log('Cron: fetched', messages.length, 'messages at', new Date().toISOString());
-
-           await postEmailFetch(messages, null);
-
-          // fetch and handle each message (call postEmailFetch for processing)
-          for (const m of messages) {
-            try {
-              const full = await gmail.users.messages.get({
-                userId: 'me',
-                id: m.id,
-                format: 'full'
-              });
-
-              const headers = full.data.payload?.headers || [];
-              const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
-              if(from.includes('ayushman.manishankar@reverieinc.com')){
-                console.log('Reverie email found');
-                continue;
-              }
-              const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
-              const msgMeta = {
-                id: m.id,
-                threadId: full.data.threadId,
-                snippet: full.data.snippet,
-                from,
-                subject
-              };
-
-              // call the same hook used in endpoints
-              // await postEmailFetch(msgMeta, full);
-            } catch (innerErr) {
-              console.error('Error fetching or processing message in cron:', innerErr);
-            }
-          }
-        }
-      } catch (err) {
-        console.error('Cron error', err.message || err);
-      }
-    });
-    console.log('Gmail poller started (cron).');
-  } else {
-    console.log('No tokens.json found — cron not started. Visit /auth to authorize.');
-  }
-} catch (err) {
-  console.error('Failed to start cron:', err);
-}
-
-module.exports = router;
+module.exports = { router, ensureAuth, oauth2Client };

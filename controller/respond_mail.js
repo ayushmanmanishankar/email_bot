@@ -1,132 +1,325 @@
-import { GoogleGenAI } from "@google/genai";
+// controller/respond_mail.js
+const { google } = require('googleapis');
+const { GoogleGenAI } = require('@google/genai'); // change if using other client
+const localDB = require('./db');
 
+const MY_EMAIL = process.env.MY_EMAIL || 'test.demo@reverieinc.com';
 
-export async function respond_mail(thread, toEmail, subject) {
-    const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY });
+// extract address from header like "Name <a@b.com>"
+function extractEmailAddress(headerValue) {
+    if (!headerValue) return '';
+    const m = headerValue.match(/<([^>]+)>/);
+    return m ? m[1].trim() : (headerValue.includes('@') ? headerValue.trim() : '');
+}
 
-    //context
+function buildQuotedSnippet(latest) {
+    const original = latest.snippet || '';
+    const date = latest.date || '';
+    const from = latest.from || '';
+    if (!original) return '';
+    const quoted = original.split('\n').map(l => `> ${l}`).join('\n');
+    return `On ${date}, ${from} wrote:\n${quoted}\n\n`;
+}
 
+function extractJsonBlock(text) {
+    if (!text) return null;
+    const jsonFence = /```json([\s\S]*?)```/i;
+    const fence = /```([\s\S]*?)```/;
+    let m = jsonFence.exec(text);
+    if (m) return m[1].trim();
+    m = fence.exec(text);
+    if (m) return m[1].trim();
+    const braceMatch = text.match(/\{[\s\S]*\}/);
+    return braceMatch ? braceMatch[0] : null;
+}
+
+// send raw MIME with In-Reply-To / References + threadId
+async function sendMailRaw(gmail, { toEmail, subject, body, threadId = null, inReplyTo = null, references = null, fromHeader = null }) {
+    const headers = [
+        `From: ${fromHeader || MY_EMAIL}`,
+        `To: ${toEmail}`,
+        `Subject: ${subject}`,
+        `MIME-Version: 1.0`,
+        `Content-Type: text/plain; charset="UTF-8"`,
+        `Content-Transfer-Encoding: 7bit`
+    ];
+    if (inReplyTo) headers.push(`In-Reply-To: ${inReplyTo}`);
+    if (references) headers.push(`References: ${references}`);
+
+    const raw = `${headers.join('\r\n')}\r\n\r\n${body}`;
+    const encoded = Buffer.from(raw, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const requestBody = { raw: encoded };
+    if (threadId) requestBody.threadId = threadId;
+
+    const resp = await gmail.users.messages.send({ userId: 'me', requestBody });
+    return resp.data;
+}
+
+/**
+ * respond_mail(thread, toEmail, subject, options)
+ *
+ * thread: COMPACT context array provided by poller/process (oldest->newest). It is NOT the full DB thread.
+ * options: { oauth2Client, gmail, aiClient, ourFromHeader (optional) }
+ *
+ * The function will:
+ * - call LLM with the compact thread
+ * - read the full thread from DB to build proper In-Reply-To / References and threadId for sending
+ * - send the reply
+ * - fetch sent message headers to record Message-ID
+ */
+exports.respond_mail = async function respond_mail(thread, toEmail, subject, options = {}) {
+    if (!Array.isArray(thread) || thread.length === 0) {
+        return { ok: false, error: 'empty_context' };
+    }
+
+    // Normalize compact LLM context
+    thread = thread.slice().sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    // Build gmail client
+    let gmail = options.gmail;
+    if (!gmail && options.oauth2Client) gmail = google.gmail({ version: 'v1', auth: options.oauth2Client });
+    if (!gmail) return { ok: false, error: 'gmail_client_required' };
+
+    // AI client
+    const aiClient = options.aiClient || new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY });
+
+    // latest message in the compact context is the most recent item we want to reply to
+    const latest = thread[thread.length - 1];
+
+    // If latest is from us, don't reply
+    if ((latest.from || '').toLowerCase().includes((process.env.MY_EMAIL || MY_EMAIL).toLowerCase())) {
+        return { ok: false, reason: 'latest_from_us' };
+    }
+
+    // Resolve recipient: prefer Reply-To if present in compact context item; otherwise From
+    const resolvedTo = toEmail || extractEmailAddress(latest.replyToHeader || latest.from);
+
+    // Compose subject
+    const baseSubject = subject || (latest.subject || 'Enquiry');
+    const replySubject = baseSubject.toLowerCase().startsWith('re:') ? baseSubject : `Re: ${baseSubject}`;
+
+    // Build LLM prompt from compact context (this is what we DO NOT change)
+    const threadText = thread.map(m => `From: ${m.from}\nDate: ${m.date}\nSubject: ${m.subject}\nSnippet: ${m.snippet || ''}\n`).join('\n----\n');
     const context = `
-  CubeRoot (cuberoot.ai) : Voice AI That Works Like Your Best Agent, at Scale
-Overcome language barriers, high costs, and inadequate support, ensuring top-notch customer and citizen experiences. Build tailored Gen AI Voice Agents/bots, providing 24/7 assistance, cutting operational costs, ensuring security, and delivering scalable intelligent interactions.
+        You are an AI assistant replying to student enquiries (registrations, course info, scheduling, fee receipts, ID card requests, electives, etc.).
 
+        Rules for your output:
+        - Always produce a complete, polite, professional plain-text reply suitable to send directly to the student.
+        - DO NOT use placeholders such as [Website URL], [Financial Institution], or the token [ASSUMED].
+        - DO NOT add disclaimers like "Please verify" or "Note: the following items were assumed".
+        - DO NOT add any content such as "Note: the following items were assumed for drafting this reply:" or anything similar that does not make any sense to the users or students.
+        - DO NOT add content like: Filled fields: [bank_name, website, processing_time] in the email "reply" body.
+        - If essential non-sensitive details are missing, fill them with realistic values from the following defaults:
+        • University name: "Birla Institute of Technology And Science, Pilani" in short "(BITS Pilani)"
+        • Example partner banks: "State Bank of India", "HDFC Bank", "Axis Bank"
+        • Example bank loan URLs: 
+            - "https://www.sbi.co.in/education-loan"
+            - "https://www.hdfcbank.com/personal/borrow/educational-loan"
+            - "https://www.axisbank.com/retail/loans/education-loan"
+        • University page: "https://www.bits-pilani.ac.in/"
+        • Replacement student ID fee: "INR 250"
+        • Typical processing time: "3 business days"
+        - If the query requires sensitive information (passport number, Aadhaar, SSN, legal/financial refund issues), set requires_human_review=true and do not fabricate such details.
 
-Conversational Intelligence
-Enabling enterprises to engage customers with natural, human-like voice interactions
-CubeRoot Voice AI Agents replicate real conversations with contextual understanding, natural intonation, and support for multiple Indian languages. This ensures customers feel heard, understood, and valued at every touchpoint.
+        Return valid JSON only, with this schema:
+        {
+        "reply": "Plain text email body",
+        "requires_human_review": false,
+        "reason": "",
+        "filled_fields": []
+        }
+        - NO MATTER WHAT, The "reply" must be final, with no placeholders, brackets, or disclaimers.
+        - The "filled_fields" array must list the fields you invented or defaulted (e.g., ["bank_name","website","processing_time"]).
+    `;
+    const instructions = `
+        ${context}
 
-Operational Agility
-Optimizing costs and boosting performance across customer engagement
-CubeRoot qualifies and routes leads instantly, ensuring sales teams focus only on high-value prospects while reducing manual effort.
+        Here is the full email thread:
+        -----------------------------------
+        ${threadText}
+        -----------------------------------
+        Now produce the JSON output exactly as specified above. 
+        - The "reply" must contain no meta markers and be ready to send to the student.
+        - The "filled_fields" field must list any fields you invented; DO NOT include those names inside the "reply" text.
+        - If the reply requires a human review, set requires_human_review to true and explain briefly in "reason". 
+        Return ONLY valid JSON (no code fences).
+    `;
 
+    const prompt = { model: "gemma-3n-e2b-it", contents: [{ role: "user", parts: [{ text: instructions }] }] };
 
-
-Enterprise Readiness
-Secure, compliant, and designed for mission-critical deployments
-End-to-end encryption, secure hosting in India, and role-based access ensure compliance with RBI and enterprise IT policies.
-
-Amplify the Power of CubeRoot with Advanced AI Modules & Integrations
-CubeRoot’s suite of AI modules and integrations is purpose-built to elevate your Voice AI Agents, delivering deeper automation, faster response times, and seamless enterprise connectivity for superior customer experiences.
-
-Speech-to-Text
-(STT)
-Reverie's Speech-to-Text API empowers IndoCord by converting spoken words into text, enhancing the platform's voice bot capabilities.
-
-Accurate Transcription: Enables voice interaction, converting spoken commands into accurate text inputs for bots.
-Seamless Voice Integration: Enhances user experience by enabling natural voice interactions within chatbots.
-Multilingual Support: Ensures effective communication by transcribing multiple Indian languages accurately.
-Text-to-Speech
-(TTS)
-Reverie's Text-to-Speech API enriches IndoCord by converting written text into spoken words, enhancing the platform's voice capabilities.
-
-Adaptive and Real-time Processing: Employs adaptive technology for real-time processing, ensuring dynamic adjustments to pacing, tone, and emphasis. 
-Customizable Voice Generation: Allows businesses to tailor voice outputs (male/female voices) according to brand requirements.
-Multiple Language Support: Delivers spoken content in various languages, broadening reach and accessibility. 
-Conversation Orchestration
-Cuberoot’s Conversation Orchestration engine empowers enterprises by seamlessly connecting the Voice AI Agent with backend systems, ensuring every interaction leads to smart, outcome-driven actions.
-
-Workflow Automation: Triggers actions such as updating CRM records, sending reminders, or raising service tickets directly from conversations.
-System Integration: Connects smoothly with dialers, CRMs, payment gateways, and ticketing platforms for end-to-end automation.
-Context Preservation: Maintains conversational context across multiple touchpoints, enabling smooth handovers between human agents and AI.
- 
-Neural Machine Translation (NMT)
-Reverie's Neural Machine Translation API enriches IndoCord by facilitating seamless translation between languages.
-
-Efficient Language Translation: Allows for fluid communication by translating text inputs accurately.
-Cross-Lingual Conversations: Enables multilingual bots, fostering communication across diverse language speakers.
-Real-time Translation: Facilitates instantaneous translation, enhancing multiregional user engagement.
-Analytics & Reporting
-Cuberoot’s Analytics and Reporting module transforms call data into actionable business intelligence, helping enterprises optimize performance and outcomes.
-
-Real-time Dashboards: Track live call metrics such as duration, response rates, and resolution outcomes.
-Performance Insights: Identify patterns in lead conversion, collections efficiency, and customer sentiment.
-Data-driven Decisions: Enable business leaders to refine strategies with clear visibility into agent performance and ROI impact.
-Engage Customers with Human-like Voice Conversations, at Scale
-Cuberoot Voice AI Agent delivers 24/7 automated calling, enabling enterprises to reach, qualify, and support customers in their preferred language — faster, smarter, and more cost-efficient.
-
-Design
-Deploy
-Integrate
-Test
-Go Live
-All in 14 Days
-77%
-Increase in Customer Reach
-
-80%
-Leads Qualified within Minutes
-
-60%
-Reduction in Calling Costs
-
-50%
-Improvement in Customer Satisfaction
-
-87%
-Reduction in Scalability
-
-Experiences Designed to Engage, Every Step of the Way.
-For banks and financial institutions, technology investments hinge on several key criteria: flexibility, customization capabilities, process automation, 99% uptime, the technology partner’s in-house tech-stack and proven industry experience. Voice AI Agents, in particular, have demonstrated their capability in automating repetitive queries, lead generation, and lead qualification. As AI models continue to learn and evolve, these agents will be able to handle more complex customer queries in the future.
-  `
-
-    const prompt = {
-        model: "gemma-3n-e2b-it",
-        contents: `You are an expert email responder. A user has sent the following email, which is in JSON array format. Please analyze the email and generate a professional and helpful response in text format just the body of the email. Maintain the original tone of the email as much as possible. Here is the context of the company: ${context}\n\n Here is the email content:\n\n${thread}`
-    }
-
-    const repsonse = await ai.models.generateContent(prompt);
-    let text = repsonse?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (text.startsWith("```json")) {
-        text = text.substring(7, text.length - 3).trim();
-    }
-    console.log({text});
-    return {
-        subject: `Re: ${subject}`,
-        body: text,
-        toEmail: toEmail
-    }
-
-}
-
-async function sendMail(email, response) {
-    //use sendgrid
-    const sgMail = require('@sendgrid/mail');
-    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-
-    const fromEmail = 'ayushman.manishankar@reverieinc.com';
-    const toEmail = email.from;
-
-    const msg = {
-        to: toEmail,
-        from: fromEmail,
-        subject: 'Response to your email',
-        html: response
-    }
-
+    // Call LLM
+    let llmRaw = '';
     try {
-        await sgMail.send(msg);
-        console.log('Email sent successfully');
-    } catch (error) {
-        console.error('Error sending email:', error);
+        const aiResp = await aiClient.models.generateContent(prompt);
+        llmRaw = aiResp?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    } catch (err) {
+        console.error('LLM call failed:', err);
+        // Mark compact-context messages (if present in DB) for human review
+        const db = await localDB.loadDB();
+        for (const m of thread) {
+            if (db.messages && db.messages[m.id]) {
+                db.messages[m.id].status = 'human_review';
+                db.messages[m.id].humanReviewReason = 'LLM call failed';
+            }
+        }
+        await localDB.saveDB(db);
+        return { ok: false, human_review: true, reason: 'llm_error', details: String(err) };
     }
-}
+
+    // parse JSON response
+    let parsed;
+    try {
+        parsed = JSON.parse(extractJsonBlock(llmRaw) || llmRaw);
+    } catch (err) {
+        console.error('LLM returned unparsable JSON:', err);
+        const db = await localDB.loadDB();
+        for (const m of thread) {
+            if (db.messages && db.messages[m.id]) {
+                db.messages[m.id].status = 'human_review';
+                db.messages[m.id].humanReviewReason = 'LLM returned unparsable JSON';
+                db.messages[m.id].llm_raw = llmRaw;
+            }
+        }
+        await localDB.saveDB(db);
+        return { ok: false, human_review: true, reason: 'unparsable_llm', raw: llmRaw };
+    }
+
+    const replyText = parsed && parsed.reply ? String(parsed.reply).trim() : null;
+    const requiresHuman = parsed && !!parsed.requires_human_review;
+    if (requiresHuman || !replyText) {
+        // mark compact-context messages in DB for human review
+        const db = await localDB.loadDB();
+        for (const m of thread) {
+            if (db.messages && db.messages[m.id]) {
+                db.messages[m.id].status = 'human_review';
+                db.messages[m.id].humanReviewReason = parsed ? (parsed.reason || 'LLM requested review') : 'LLM empty reply';
+                db.messages[m.id].llm_raw = llmRaw;
+            }
+        }
+        await localDB.saveDB(db);
+        return { ok: false, human_review: true, reason: parsed ? parsed.reason : 'empty_reply' };
+    }
+
+    // Read authoritative full thread from DB to build RFC headers (References / In-Reply-To) and threadId
+    const dbFull = await localDB.loadDB();
+    const fullThread = (dbFull.threads && dbFull.threads[latest.threadId]) ?
+        (dbFull.threads[latest.threadId].map(id => dbFull.messages[id]).filter(Boolean).sort((a, b) => new Date(a.date) - new Date(b.date))) :
+        [latest];
+
+    // Collect Message-ID headers for References (oldest->newest)
+    const messageIdHeaders = fullThread.map(m => m.messageIdHeader).filter(Boolean);
+    const references = messageIdHeaders.length ? messageIdHeaders.join(' ') : fullThread.map(m => (m.id ? `<${m.id}>` : null)).filter(Boolean).join(' ');
+    const inReplyTo = (latest.messageIdHeader && latest.messageIdHeader.trim()) ? latest.messageIdHeader : (latest.id ? `<${latest.id}>` : null);
+    const threadId = latest.threadId || (fullThread[0] && fullThread[0].threadId) || null;
+
+    // Build quoted body: include the reply plus quoted latest snippet so recipient sees their question
+    const quoted = buildQuotedSnippet(latest);
+    // const finalBody = `${replyText}\n\n---\n${quoted}`;
+    const finalBody = `${replyText}\n`;
+
+    // perform send
+    let sendResp;
+    try {
+        sendResp = await sendMailRaw(gmail, {
+            toEmail: resolvedTo || extractEmailAddress(latest.from),
+            subject: replySubject,
+            body: finalBody,
+            threadId,
+            inReplyTo,
+            references,
+            fromHeader: options.ourFromHeader || MY_EMAIL
+        });
+    } catch (err) {
+        console.error('Failed to send mail:', err);
+        // mark compact-context messages for human review
+        const db = await localDB.loadDB();
+        for (const m of thread) {
+            if (db.messages && db.messages[m.id]) {
+                db.messages[m.id].status = 'human_review';
+                db.messages[m.id].humanReviewReason = 'Failed to send via Gmail: ' + (err.message || String(err));
+                db.messages[m.id].llm_raw = llmRaw;
+            }
+        }
+        await localDB.saveDB(db);
+        return { ok: false, error: 'send_failed', details: String(err) };
+    }
+
+    // Try to fetch sent message headers to get its Message-ID
+    let sentMessageHeader = null;
+    try {
+        const sentFull = await gmail.users.messages.get({ userId: 'me', id: sendResp.id, format: 'full' });
+        const sentHeaders = sentFull.data.payload?.headers || [];
+        const headerValue = (name) => {
+            const h = sentHeaders.find(h => h.name && h.name.toLowerCase() === name.toLowerCase());
+            return h ? h.value : null;
+        };
+        sentMessageHeader = headerValue('message-id') || headerValue('message-id') || null;
+    } catch (e) {
+        console.warn('Could not fetch sent message headers:', e && e.message ? e.message : e);
+    }
+
+    // Persist DB updates: mark compact-context new messages responded (only those that were 'new' and not sentByUs)
+    const dbAfter = await localDB.loadDB();
+    for (const m of fullThread.filter(x => x.status === 'new' && !x.sentByUs)) {
+        if (dbAfter.messages && dbAfter.messages[m.id]) {
+            dbAfter.messages[m.id].status = 'responded';
+            dbAfter.messages[m.id].respondedAt = new Date().toISOString();
+            dbAfter.messages[m.id].reply = {
+                subject: replySubject,
+                body: finalBody,
+                sentMessageId: sendResp.id,
+                sentAt: new Date().toISOString()
+            };
+            dbAfter.messages[m.id].llm_raw = llmRaw;
+            dbAfter.messages[m.id].llm_parsed = parsed;
+        }
+    }
+
+    // Insert a DB record for the sent message (so poller marks it as sentByUs)
+    try {
+        const sentId = String(sendResp.id);
+        if (!dbAfter.messages[sentId]) {
+            dbAfter.messages[sentId] = {
+                id: sentId,
+                threadId: sendResp.threadId || threadId,
+                snippet: (replyText || '').slice(0, 300),
+                from: options.ourFromHeader || MY_EMAIL,
+                subject: replySubject,
+                date: new Date().toISOString(),
+                messageIdHeader: sentMessageHeader,
+                sentByUs: true,
+                status: 'sent'
+            };
+            dbAfter.threads[dbAfter.messages[sentId].threadId] = dbAfter.threads[dbAfter.messages[sentId].threadId] || [];
+            if (!dbAfter.threads[dbAfter.messages[sentId].threadId].includes(sentId)) {
+                dbAfter.threads[dbAfter.messages[sentId].threadId].push(sentId);
+            }
+        } else {
+            dbAfter.messages[sentId].sentByUs = true;
+            dbAfter.messages[sentId].status = dbAfter.messages[sentId].status || 'sent';
+            dbAfter.messages[sentId].messageIdHeader = dbAfter.messages[sentId].messageIdHeader || sentMessageHeader;
+        }
+    } catch (e) {
+        console.warn('Could not insert sent message record:', e && e.message ? e.message : e);
+    }
+
+    await localDB.saveDB(dbAfter);
+
+    // If caller passed addRecentlySent (poller), call it
+    if (typeof options.addRecentlySent === 'function') {
+        try {
+            options.addRecentlySent(String(sendResp.id));
+        } catch (e) { /* ignore */ }
+    }
+
+    return {
+        ok: true,
+        sentMessageId: sendResp.id,
+        sentThreadId: sendResp.threadId,
+        sentMessageHeader,
+        sentBody: finalBody,
+        sentSubject: replySubject,
+        parsed,
+        llmRaw
+    };
+};
