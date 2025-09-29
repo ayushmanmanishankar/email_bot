@@ -109,6 +109,11 @@ exports.respond_mail = async function respond_mail(thread, toEmail, subject, opt
         - DO NOT add disclaimers like "Please verify" or "Note: the following items were assumed".
         - DO NOT add any content such as "Note: the following items were assumed for drafting this reply:" or anything similar that does not make any sense to the users or students.
         - DO NOT add content like: Filled fields: [bank_name, website, processing_time] in the email "reply" body.
+        - DO NOT add content like: [Phone Number] inside the email "reply" body.
+        - DO NOT mention this is an AI-generated response or similar.
+        - DO NOT include any text outside the JSON structure specified below.
+        - Always respond in English.
+        - If the query can be answered using non-sensitive information, provide a complete reply using the details from the email thread.
         - If essential non-sensitive details are missing, fill them with realistic values from the following defaults:
         • University name: "Birla Institute of Technology And Science, Pilani" in short "(BITS Pilani)"
         • Example partner banks: "State Bank of India", "HDFC Bank", "Axis Bank"
