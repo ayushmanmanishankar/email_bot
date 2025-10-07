@@ -10,6 +10,7 @@ const credentials = require('../credentials.json');
 const { client_id, client_secret } = credentials.installed || credentials.web;
 
 const REDIRECT_URI = 'http://localhost:3000/oauth2callback';
+const TOKEN_EXPIRY_BUFFER_MS = 60 * 1000;
 
 const oauth2Client = new google.auth.OAuth2(
   client_id,
@@ -21,13 +22,12 @@ const oauth2Client = new google.auth.OAuth2(
 if (!oauth2Client.__tokensListenerAdded) {
   oauth2Client.on('tokens', (newTokens) => {
     try {
-      // merge new tokens with previously saved ones if you like
       const existing = loadTokens() || {};
-      const updated = { ...existing, ...newTokens };
-      saveTokens(updated);
-      console.log('Tokens refreshed and saved.');
-    } catch (err) {
-      console.error('Failed saving refreshed tokens:', err);
+      const merged = { ...existing, ...newTokens, refresh_token: newTokens.refresh_token || existing.refresh_token };
+      saveTokens(merged);
+      console.log('Tokens refreshed and saved via tokens event.');
+    } catch (e) {
+      console.error('Failed saving refreshed tokens from tokens event:', e);
     }
   });
   // mark flag so we won't add again
@@ -60,14 +60,56 @@ async function ensureAuth() {
   if (!tokens) {
     throw new Error('No stored tokens. Visit /auth to authorize the app.');
   }
-  // set credentials (this won't add listeners)
+
+  // set credentials into client
   oauth2Client.setCredentials(tokens);
 
-  // Optionally, validate there is an access_token; if expired you will get 401 on calls and client will try refresh
-  if (!oauth2Client.credentials || !oauth2Client.credentials.access_token) {
-    // still allow poller to call and the client will refresh using refresh_token when API calls are made,
-    // but you can throw here if you prefer earlier failure
-    console.warn('ensureAuth: oauth2Client has no access_token currently (will attempt refresh on demand).');
+  // make sure we have a refresh_token available (either in stored tokens or in client.credentials)
+  const refreshToken = (oauth2Client.credentials && oauth2Client.credentials.refresh_token) || tokens.refresh_token;
+  if (!refreshToken) {
+    // no refresh token -> must re-authorize
+    throw new Error('No refresh_token available. Re-authorize the app by visiting /auth.');
+  }
+
+  // Check if access_token exists and is not expiring soon
+  const expiry = oauth2Client.credentials && oauth2Client.credentials.expiry_date;
+  const needsRefresh = !oauth2Client.credentials || !oauth2Client.credentials.access_token ||
+    (typeof expiry === 'number' && Date.now() > (expiry - TOKEN_EXPIRY_BUFFER_MS));
+
+  if (!needsRefresh) {
+    // tokens look good
+    return;
+  }
+
+  // Attempt explicit refresh using the refresh token
+  try {
+    // refreshToken returns an object; library versions differ in shape
+    const resp = await oauth2Client.refreshToken(refreshToken);
+    // resp may be { credentials: { access_token, expiry_date, ... } } or tokens directly
+    const newCreds = (resp && resp.credentials) ? resp.credentials : resp;
+
+    // Merge: keep refresh_token from original tokens if provider didn't return it on refresh
+    const merged = {
+      ...tokens,
+      ...newCreds,
+      refresh_token: newCreds.refresh_token || tokens.refresh_token || refreshToken
+    };
+
+    // persist merged tokens
+    saveTokens(merged);
+    oauth2Client.setCredentials(merged);
+    console.log('Access token refreshed and saved.');
+    return;
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    // common case: invalid_grant -> refresh token revoked/expired
+    if (msg.includes('invalid_grant') || msg.includes('invalid_grant')) {
+      // Optionally delete tokens file here so next run forces reauth:
+      // fs.unlinkSync(TOKEN_PATH);
+      throw new Error('invalid_grant: refresh token invalid or revoked — re-authorize the app at /auth.');
+    }
+    // rethrow other errors
+    throw err;
   }
 }
 
