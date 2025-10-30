@@ -174,6 +174,11 @@ async function startGmailPoller(oauth2Client, ensureAuth) {
     console.log('Gmail poller started (cron every 5 sec).');
   } catch (err) {
     console.error('Failed to start cron:', err && err.message ? err.message : err);
+     if (err.message && err.message.includes('invalid_grant')) {
+      console.error('Stopping cron due to invalid_grant. Delete tokens.json (or re-authorize) and restart to resume.');
+      try { task.stop(); } catch (e) { /* ignore */ }
+      // optionally notify via email/alert here
+    }
   }
 }
 
